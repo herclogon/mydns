@@ -1,0 +1,263 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/miekg/dns"
+)
+
+const (
+	// Default DNS port
+	defaultPort = "53"
+	// Timeout for DNS queries
+	queryTimeout = 5 * time.Second
+	// Maximum recursion depth
+	maxRecursionDepth = 15
+)
+
+// Root DNS servers (a.root-servers.net through m.root-servers.net)
+var rootServers = []string{
+	"198.41.0.4:53",      // a.root-servers.net
+	"199.9.14.201:53",    // b.root-servers.net
+	"192.33.4.12:53",     // c.root-servers.net
+	"199.7.91.13:53",     // d.root-servers.net
+	"192.203.230.10:53",  // e.root-servers.net
+	"192.5.5.241:53",     // f.root-servers.net
+	"192.112.36.4:53",    // g.root-servers.net
+	"198.97.190.53:53",   // h.root-servers.net
+	"192.36.148.17:53",   // i.root-servers.net
+	"192.58.128.30:53",   // j.root-servers.net
+	"193.0.14.129:53",    // k.root-servers.net
+	"199.7.83.42:53",     // l.root-servers.net
+	"202.12.27.33:53",    // m.root-servers.net
+}
+
+type DNSServer struct {
+	client *dns.Client
+}
+
+func NewDNSServer() *DNSServer {
+	return &DNSServer{
+		client: &dns.Client{
+			Timeout: queryTimeout,
+		},
+	}
+}
+
+// resolve performs recursive DNS resolution starting from root servers
+func (s *DNSServer) resolve(qname string, qtype uint16, depth int) (*dns.Msg, error) {
+	if depth > maxRecursionDepth {
+		return nil, fmt.Errorf("maximum recursion depth exceeded")
+	}
+
+	log.Printf("[Depth %d] Resolving %s %s", depth, qname, dns.TypeToString[qtype])
+
+	// Start with root servers
+	nameservers := rootServers
+
+	// Iterate through the DNS hierarchy
+	for {
+		response, ns, err := s.queryNameservers(qname, qtype, nameservers)
+		if err != nil {
+			return nil, err
+		}
+
+		// If we got an answer, return it
+		if len(response.Answer) > 0 {
+			log.Printf("[Depth %d] Found answer for %s: %d records", depth, qname, len(response.Answer))
+			return response, nil
+		}
+
+		// Check for CNAME in Answer section
+		for _, rr := range response.Answer {
+			if cname, ok := rr.(*dns.CNAME); ok {
+				log.Printf("[Depth %d] Following CNAME: %s -> %s", depth, qname, cname.Target)
+				return s.resolve(cname.Target, qtype, depth+1)
+			}
+		}
+
+		// Look for nameservers in Authority section
+		var nextNS []string
+		nsNames := make(map[string]bool)
+
+		for _, rr := range response.Ns {
+			if ns, ok := rr.(*dns.NS); ok {
+				nsNames[ns.Ns] = true
+			}
+		}
+
+		// Try to get IPs from Additional section
+		for nsName := range nsNames {
+			found := false
+			for _, rr := range response.Extra {
+				if a, ok := rr.(*dns.A); ok && strings.EqualFold(a.Hdr.Name, nsName) {
+					nextNS = append(nextNS, net.JoinHostPort(a.A.String(), "53"))
+					found = true
+				} else if aaaa, ok := rr.(*dns.AAAA); ok && strings.EqualFold(aaaa.Hdr.Name, nsName) {
+					nextNS = append(nextNS, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+					found = true
+				}
+			}
+
+			// If no glue records, resolve the nameserver
+			if !found {
+				log.Printf("[Depth %d] Resolving nameserver: %s", depth, nsName)
+				nsResp, err := s.resolve(nsName, dns.TypeA, depth+1)
+				if err == nil && len(nsResp.Answer) > 0 {
+					for _, rr := range nsResp.Answer {
+						if a, ok := rr.(*dns.A); ok {
+							nextNS = append(nextNS, net.JoinHostPort(a.A.String(), "53"))
+						}
+					}
+				}
+			}
+		}
+
+		if len(nextNS) == 0 {
+			// No more nameservers to query
+			if response.Rcode == dns.RcodeNameError {
+				return response, nil // NXDOMAIN
+			}
+			return nil, fmt.Errorf("no nameservers found and no answer")
+		}
+
+		log.Printf("[Depth %d] Following referral to %d nameserver(s)", depth, len(nextNS))
+		nameservers = nextNS
+	}
+}
+
+// queryNameservers queries a list of nameservers until one responds
+func (s *DNSServer) queryNameservers(qname string, qtype uint16, nameservers []string) (*dns.Msg, string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(qname), qtype)
+	m.RecursionDesired = false // We do the recursion
+
+	for _, ns := range nameservers {
+		response, _, err := s.client.Exchange(m, ns)
+		if err == nil && response != nil {
+			return response, ns, nil
+		}
+		log.Printf("Failed to query %s: %v", ns, err)
+	}
+
+	return nil, "", fmt.Errorf("all nameservers failed")
+}
+
+// handleDNSRequest handles incoming DNS queries
+func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	// Log the incoming query
+	if len(r.Question) == 0 {
+		response := new(dns.Msg)
+		response.SetRcode(r, dns.RcodeFormatError)
+		w.WriteMsg(response)
+		return
+	}
+
+	q := r.Question[0]
+	log.Printf("Query: %s %s from %s", q.Name, dns.TypeToString[q.Qtype], w.RemoteAddr())
+
+	// Perform recursive resolution
+	response, err := s.resolve(q.Name, q.Qtype, 0)
+	
+	if err != nil {
+		log.Printf("Resolution failed: %v", err)
+		response = new(dns.Msg)
+		response.SetRcode(r, dns.RcodeServerFailure)
+	}
+
+	// Set the response ID to match the query
+	response.SetReply(r)
+
+	// Write the response back to the client
+	if err := w.WriteMsg(response); err != nil {
+		log.Printf("Error writing response: %v", err)
+	} else {
+		log.Printf("Response sent: %d answers, %d authority, %d additional", 
+			len(response.Answer), len(response.Ns), len(response.Extra))
+	}
+}
+
+func (s *DNSServer) Start(port string) error {
+	// Create DNS server for UDP
+	serverUDP := &dns.Server{
+		Addr:    ":" + port,
+		Net:     "udp",
+		Handler: dns.HandlerFunc(s.handleDNSRequest),
+	}
+
+	// Create DNS server for TCP
+	serverTCP := &dns.Server{
+		Addr:    ":" + port,
+		Net:     "tcp",
+		Handler: dns.HandlerFunc(s.handleDNSRequest),
+	}
+
+	// Start UDP server in goroutine
+	go func() {
+		log.Printf("Starting DNS server on UDP port %s", port)
+		if err := serverUDP.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start UDP server: %v", err)
+		}
+	}()
+
+	// Start TCP server in goroutine
+	go func() {
+		log.Printf("Starting DNS server on TCP port %s", port)
+		if err := serverTCP.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start TCP server: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	log.Println("Shutting down DNS server...")
+	serverUDP.Shutdown()
+	serverTCP.Shutdown()
+
+	return nil
+}
+
+func main() {
+	port := defaultPort
+	
+	// Check if running as non-root and port is 53
+	if port == "53" {
+		if os.Geteuid() != 0 {
+			log.Println("Warning: Port 53 requires root privileges. Consider using a higher port (e.g., 5353) or run with sudo.")
+			log.Println("Falling back to port 5353...")
+			port = "5353"
+		}
+	}
+
+	// Get local IP addresses
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		log.Println("Server will listen on:")
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					log.Printf("  - %s:%s", ipnet.IP.String(), port)
+				}
+			}
+		}
+	}
+
+	log.Printf("Using root DNS servers for recursive resolution")
+	log.Printf("Root servers: %d configured", len(rootServers))
+
+	server := NewDNSServer()
+	if err := server.Start(port); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}

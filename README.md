@@ -162,3 +162,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Disclaimer
 
 This is an educational/experimental DNS server. For production use, consider established solutions like BIND, Unbound, or PowerDNS.
+
+## Known Limitations
+
+- Some domains with complex nameserver dependencies may hit the recursion limit (e.g., domains using Cloudflare nameservers in other TLDs can create circular dependencies)
+- No DNSSEC validation
+- Limited caching (5-minute TTL)
+- For best results, query common domains like `example.com`, `google.com`, etc.

@@ -1,14 +1,20 @@
-.PHONY: help build run stop clean test
+.PHONY: help build run stop clean test binary
 
 IMAGE_NAME := mydns
 CONTAINER_NAME := mydns-server
 PORT := 5353
+BINARY_NAME := mydns
 
 help: ## Show this help message
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Targets:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
+
+binary: ## Build native binary
+	@echo "Building native binary..."
+	go build -o $(BINARY_NAME) .
+	@echo "Binary built: $(BINARY_NAME)"
 
 build: ## Build the Docker image
 	@echo "Building Docker image..."

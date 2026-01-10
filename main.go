@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,6 +21,8 @@ const (
 	queryTimeout = 5 * time.Second
 	// Maximum recursion depth
 	maxRecursionDepth = 15
+	// Cache TTL
+	cacheTTL = 5 * time.Minute
 )
 
 // Root DNS servers (a.root-servers.net through m.root-servers.net)
@@ -39,8 +42,55 @@ var rootServers = []string{
 	"202.12.27.33:53",    // m.root-servers.net
 }
 
+type cacheEntry struct {
+	response  *dns.Msg
+	timestamp time.Time
+}
+
+type queryContext struct {
+	inFlight map[string]bool
+	mu       sync.Mutex
+}
+
+func (qc *queryContext) isInFlight(key string) bool {
+	qc.mu.Lock()
+	defer qc.mu.Unlock()
+	return qc.inFlight[key]
+}
+
+func (qc *queryContext) markInFlight(key string) {
+	qc.mu.Lock()
+	defer qc.mu.Unlock()
+	qc.inFlight[key] = true
+}
+
+func (qc *queryContext) unmarkInFlight(key string) {
+	qc.mu.Lock()
+	defer qc.mu.Unlock()
+	delete(qc.inFlight, key)
+}
+
 type DNSServer struct {
 	client *dns.Client
+	cache  map[string]*cacheEntry
+	mu     sync.RWMutex
+}
+
+// Common TLD nameserver IPs to avoid circular dependencies
+var tldHints = map[string][]string{
+	"a.gtld-servers.net.": {"192.5.6.30"},
+	"b.gtld-servers.net.": {"192.33.14.30"},
+	"c.gtld-servers.net.": {"192.26.92.30"},
+	"d.gtld-servers.net.": {"192.31.80.30"},
+	"e.gtld-servers.net.": {"192.12.94.30"},
+	"f.gtld-servers.net.": {"192.35.51.30"},
+	"g.gtld-servers.net.": {"192.42.93.30"},
+	"h.gtld-servers.net.": {"192.54.112.30"},
+	"i.gtld-servers.net.": {"192.43.172.30"},
+	"j.gtld-servers.net.": {"192.48.79.30"},
+	"k.gtld-servers.net.": {"192.52.178.30"},
+	"l.gtld-servers.net.": {"192.41.162.30"},
+	"m.gtld-servers.net.": {"192.55.83.30"},
 }
 
 func NewDNSServer() *DNSServer {
@@ -48,14 +98,69 @@ func NewDNSServer() *DNSServer {
 		client: &dns.Client{
 			Timeout: queryTimeout,
 		},
+		cache: make(map[string]*cacheEntry),
+	}
+}
+
+func (s *DNSServer) cacheKey(qname string, qtype uint16) string {
+	return fmt.Sprintf("%s:%d", strings.ToLower(qname), qtype)
+}
+
+func (s *DNSServer) getFromCache(qname string, qtype uint16) *dns.Msg {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	key := s.cacheKey(qname, qtype)
+	entry, ok := s.cache[key]
+	if !ok {
+		return nil
+	}
+	
+	if time.Since(entry.timestamp) > cacheTTL {
+		return nil
+	}
+	
+	return entry.response.Copy()
+}
+
+func (s *DNSServer) putInCache(qname string, qtype uint16, response *dns.Msg) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	key := s.cacheKey(qname, qtype)
+	s.cache[key] = &cacheEntry{
+		response:  response.Copy(),
+		timestamp: time.Now(),
 	}
 }
 
 // resolve performs recursive DNS resolution starting from root servers
 func (s *DNSServer) resolve(qname string, qtype uint16, depth int) (*dns.Msg, error) {
+	qc := &queryContext{inFlight: make(map[string]bool)}
+	return s.resolveWithContext(qname, qtype, depth, qc)
+}
+
+func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc *queryContext) (*dns.Msg, error) {
 	if depth > maxRecursionDepth {
 		return nil, fmt.Errorf("maximum recursion depth exceeded")
 	}
+
+	// Check for circular dependency
+	queryKey := fmt.Sprintf("%s:%d", strings.ToLower(qname), qtype)
+	if qc.isInFlight(queryKey) {
+		log.Printf("[Depth %d] Circular dependency detected for %s", depth, qname)
+		return nil, fmt.Errorf("circular dependency detected")
+	}
+
+	// Check cache first
+	if cached := s.getFromCache(qname, qtype); cached != nil {
+		log.Printf("[Depth %d] Cache hit for %s %s", depth, qname, dns.TypeToString[qtype])
+		return cached, nil
+	}
+
+	// Mark as in-flight
+	qc.markInFlight(queryKey)
+	defer qc.unmarkInFlight(queryKey)
 
 	log.Printf("[Depth %d] Resolving %s %s", depth, qname, dns.TypeToString[qtype])
 
@@ -64,7 +169,7 @@ func (s *DNSServer) resolve(qname string, qtype uint16, depth int) (*dns.Msg, er
 
 	// Iterate through the DNS hierarchy
 	for {
-		response, ns, err := s.queryNameservers(qname, qtype, nameservers)
+		response, _, err := s.queryNameservers(qname, qtype, nameservers)
 		if err != nil {
 			return nil, err
 		}
@@ -72,6 +177,7 @@ func (s *DNSServer) resolve(qname string, qtype uint16, depth int) (*dns.Msg, er
 		// If we got an answer, return it
 		if len(response.Answer) > 0 {
 			log.Printf("[Depth %d] Found answer for %s: %d records", depth, qname, len(response.Answer))
+			s.putInCache(qname, qtype, response)
 			return response, nil
 		}
 
@@ -79,7 +185,7 @@ func (s *DNSServer) resolve(qname string, qtype uint16, depth int) (*dns.Msg, er
 		for _, rr := range response.Answer {
 			if cname, ok := rr.(*dns.CNAME); ok {
 				log.Printf("[Depth %d] Following CNAME: %s -> %s", depth, qname, cname.Target)
-				return s.resolve(cname.Target, qtype, depth+1)
+				return s.resolveWithContext(cname.Target, qtype, depth+1, qc)
 			}
 		}
 
@@ -109,13 +215,25 @@ func (s *DNSServer) resolve(qname string, qtype uint16, depth int) (*dns.Msg, er
 			// If no glue records, resolve the nameserver
 			if !found {
 				log.Printf("[Depth %d] Resolving nameserver: %s", depth, nsName)
-				nsResp, err := s.resolve(nsName, dns.TypeA, depth+1)
+				
+				// Check hints first for common TLD servers
+				if ips, ok := tldHints[nsName]; ok {
+					log.Printf("[Depth %d] Using hint for %s", depth, nsName)
+					for _, ip := range ips {
+						nextNS = append(nextNS, net.JoinHostPort(ip, "53"))
+					}
+					continue
+				}
+				
+				nsResp, err := s.resolveWithContext(nsName, dns.TypeA, depth+1, qc)
 				if err == nil && len(nsResp.Answer) > 0 {
 					for _, rr := range nsResp.Answer {
 						if a, ok := rr.(*dns.A); ok {
 							nextNS = append(nextNS, net.JoinHostPort(a.A.String(), "53"))
 						}
 					}
+				} else if err != nil {
+					log.Printf("[Depth %d] Failed to resolve nameserver %s: %v", depth, nsName, err)
 				}
 			}
 		}
@@ -230,8 +348,11 @@ func (s *DNSServer) Start(port string) error {
 func main() {
 	port := defaultPort
 	
-	// Check if running as non-root and port is 53
-	if port == "53" {
+	// Allow PORT environment variable to override
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		port = envPort
+	} else if port == "53" {
+		// Check if running as non-root and port is 53
 		if os.Geteuid() != 0 {
 			log.Println("Warning: Port 53 requires root privileges. Consider using a higher port (e.g., 5353) or run with sudo.")
 			log.Println("Falling back to port 5353...")

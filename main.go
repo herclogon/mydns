@@ -21,8 +21,10 @@ const (
 	queryTimeout = 5 * time.Second
 	// Maximum recursion depth
 	maxRecursionDepth = 15
-	// Cache TTL
-	cacheTTL = 5 * time.Minute
+	// Minimum cache TTL (for records with very short TTL)
+	minCacheTTL = 10 * time.Second
+	// Maximum cache TTL (cap very long TTLs)
+	maxCacheTTL = 1 * time.Hour
 )
 
 // Root DNS servers (a.root-servers.net through m.root-servers.net)
@@ -43,8 +45,9 @@ var rootServers = []string{
 }
 
 type cacheEntry struct {
-	response  *dns.Msg
-	timestamp time.Time
+	response   *dns.Msg
+	timestamp  time.Time
+	expiration time.Time
 }
 
 type queryContext struct {
@@ -116,7 +119,7 @@ func (s *DNSServer) getFromCache(qname string, qtype uint16) *dns.Msg {
 		return nil
 	}
 	
-	if time.Since(entry.timestamp) > cacheTTL {
+	if time.Now().After(entry.expiration) {
 		return nil
 	}
 	
@@ -127,11 +130,60 @@ func (s *DNSServer) putInCache(qname string, qtype uint16, response *dns.Msg) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	
+	// Get the minimum TTL from the response
+	ttl := s.getMinTTL(response)
+	if ttl < minCacheTTL {
+		ttl = minCacheTTL
+	} else if ttl > maxCacheTTL {
+		ttl = maxCacheTTL
+	}
+	
+	now := time.Now()
 	key := s.cacheKey(qname, qtype)
 	s.cache[key] = &cacheEntry{
-		response:  response.Copy(),
-		timestamp: time.Now(),
+		response:   response.Copy(),
+		timestamp:  now,
+		expiration: now.Add(ttl),
 	}
+}
+
+func (s *DNSServer) getMinTTL(response *dns.Msg) time.Duration {
+	if response == nil {
+		return minCacheTTL
+	}
+	
+	minTTL := uint32(3600) // Default 1 hour
+	found := false
+	
+	// Check Answer section
+	for _, rr := range response.Answer {
+		if rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+			found = true
+		}
+	}
+	
+	// Check Authority section
+	for _, rr := range response.Ns {
+		if rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+			found = true
+		}
+	}
+	
+	// Check Additional section
+	for _, rr := range response.Extra {
+		if rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+			found = true
+		}
+	}
+	
+	if !found {
+		return minCacheTTL
+	}
+	
+	return time.Duration(minTTL) * time.Second
 }
 
 // resolve performs recursive DNS resolution starting from root servers

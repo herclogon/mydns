@@ -12,11 +12,15 @@ MyDNS is a recursive DNS resolver that implements the full DNS resolution proces
 ## Features
 
 - **True recursive resolution** - starts from root servers and follows the DNS hierarchy
+- **Smart caching** - respects DNS record TTL values (10s minimum, 1h maximum)
+- **Loop detection** - prevents circular dependencies during resolution
+- **TLD hints** - uses pre-configured IPs for common TLD servers to avoid deep recursion
 - Supports both UDP and TCP protocols
 - Handles CNAME resolution and DNS referrals
 - Resolves nameserver addresses when needed (glue records)
 - Detailed logging of the resolution process
 - Automatic port selection (53 with root, 5353 without)
+- Configurable port via PORT environment variable
 
 ## Requirements
 
@@ -46,6 +50,11 @@ sudo ./mydns
 #### Run without root privileges (port 5353):
 ```bash
 ./mydns
+```
+
+#### Use custom port via environment variable:
+```bash
+PORT=8053 ./mydns
 ```
 
 ### Docker Container
@@ -130,6 +139,9 @@ All of this happens transparently with detailed logging.
 - Handles glue records and nameserver resolution
 - Maximum recursion depth: 15 levels
 - Query timeout: 5 seconds per query
+- **Intelligent caching**: Respects DNS record TTL values (bounded between 10s-1h)
+- **Loop detection**: Tracks in-flight queries to prevent circular dependencies
+- **TLD hints**: Pre-configured IPs for common gTLD nameservers to optimize resolution
 - Docker image based on distroless for minimal attack surface (~2MB)
 
 ## Docker
@@ -142,6 +154,7 @@ The project includes a multi-stage Dockerfile that creates a minimal, secure con
 - **Security**: Runs as non-root user
 
 Available make commands:
+- `make binary` - Build native binary
 - `make build` - Build Docker image
 - `make run` - Run on port 5353
 - `make run-privileged` - Run on port 53
@@ -165,7 +178,7 @@ This is an educational/experimental DNS server. For production use, consider est
 
 ## Known Limitations
 
-- Some domains with complex nameserver dependencies may hit the recursion limit (e.g., domains using Cloudflare nameservers in other TLDs can create circular dependencies)
 - No DNSSEC validation
-- Limited caching (5-minute TTL)
-- For best results, query common domains like `example.com`, `google.com`, etc.
+- IPv6 (AAAA) nameserver resolution not fully optimized
+- No negative caching for NXDOMAIN responses
+- GeoDNS: May return different IPs than other DNS servers due to query origin location

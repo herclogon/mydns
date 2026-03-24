@@ -91,6 +91,9 @@ Deployment guidance now lives in [DEPLOYMENT.md](DEPLOYMENT.md). It covers:
 - Recursive resolution depth is capped at `15`
 - Per-query upstream timeout is `5s`
 - Cache TTLs are bounded to `10s` minimum and `1h` maximum
+- NXDOMAIN and authoritative NODATA responses are cached using SOA-derived negative TTLs when available
+- Recently failing upstream nameservers are temporarily avoided
+- Delegated nameserver addresses are cached per zone to reduce repeated NS host lookups
 - IPv6 upstream queries are only used when IPv6 appears available locally
 - The server listens on `:<port>` for both UDP and TCP, which means it attempts to bind all local IPv4 addresses on that port
 
@@ -113,9 +116,9 @@ This is an educational and experimental DNS server. For production-critical use,
 ## Known Limitations
 
 - No DNSSEC validation
-- No negative caching for NXDOMAIN
 - IPv6 nameserver resolution is basic
 - GeoDNS answers may differ from public resolvers because resolution originates from your host
+- `ANY` queries are refused to reduce abuse and unnecessary recursion
 
 ## License
 

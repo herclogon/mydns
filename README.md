@@ -23,17 +23,19 @@ MyDNS is a lightweight recursive DNS resolver written in Go. It resolves records
 
 ## Build
 
-Build the binary:
+Build the native binary:
 
 ```bash
-go build -o mydns .
+make binary
 ```
 
 Build the Docker image:
 
 ```bash
-make build
+make docker-build
 ```
+
+`make build` remains available as an alias for `make docker-build`.
 
 ## Run
 
@@ -55,10 +57,18 @@ Run on a custom port:
 PORT=8053 ./mydns
 ```
 
-Run with Docker on host port `5353`:
+Build and run with Docker on host port `5353`:
 
 ```bash
+make docker-build
 make run
+```
+
+Run with Docker on host port `53`:
+
+```bash
+make docker-build
+make run-privileged
 ```
 
 ## Test
@@ -101,6 +111,7 @@ Deployment guidance now lives in [DEPLOYMENT.md](DEPLOYMENT.md). It covers:
 
 - `make binary`
 - `make build`
+- `make docker-build`
 - `make run`
 - `make run-privileged`
 - `make logs`

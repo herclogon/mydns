@@ -1,4 +1,4 @@
-.PHONY: help build run stop clean test binary
+.PHONY: help build docker-build run stop clean test binary rebuild all
 
 IMAGE_NAME := mydns
 CONTAINER_NAME := mydns-server
@@ -16,7 +16,9 @@ binary: ## Build native binary
 	go build -o $(BINARY_NAME) .
 	@echo "Binary built: $(BINARY_NAME)"
 
-build: ## Build the Docker image
+build: docker-build ## Build the Docker image
+
+docker-build: ## Build the Docker image
 	@echo "Building Docker image..."
 	docker build -t $(IMAGE_NAME):latest .
 	@echo "Build complete!"

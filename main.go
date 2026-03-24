@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -30,6 +31,10 @@ const (
 	badNameserverTTL = 1 * time.Minute
 	// Minimum number of ready NS IPs before skipping further expensive DNS sub-resolutions
 	minReadyNS = 4
+	// Overall deadline for resolving a single client DNS query
+	queryDeadline = 3600 * 12 * time.Second
+	// Interval between periodic cache eviction sweeps
+	cacheEvictionInterval = 3600 * time.Minute
 )
 
 // Root DNS servers (a.root-servers.net through m.root-servers.net)
@@ -85,6 +90,7 @@ func (qc *queryContext) unmarkInFlight(key string) {
 
 type DNSServer struct {
 	client         *dns.Client
+	tcpClient      *dns.Client
 	cache          map[string]*cacheEntry
 	nsCache        map[string]*nsCacheEntry
 	badNameservers map[string]time.Time
@@ -113,6 +119,10 @@ var tldHints = map[string][]string{
 func NewDNSServer(acceptAny bool) *DNSServer {
 	s := &DNSServer{
 		client: &dns.Client{
+			Timeout: queryTimeout,
+		},
+		tcpClient: &dns.Client{
+			Net:     "tcp",
 			Timeout: queryTimeout,
 		},
 		cache:          make(map[string]*cacheEntry),
@@ -213,8 +223,11 @@ func (s *DNSServer) getCacheTTL(response *dns.Msg) time.Duration {
 		}
 	}
 
-	// Check Additional section
+	// Check Additional section (skip OPT pseudo-records whose Ttl field encodes EDNS flags)
 	for _, rr := range response.Extra {
+		if _, ok := rr.(*dns.OPT); ok {
+			continue
+		}
 		if rr.Header().Ttl < minTTL {
 			minTTL = rr.Header().Ttl
 			found = true
@@ -425,15 +438,53 @@ func (s *DNSServer) clearNameserverBad(ns string) {
 	delete(s.badNameservers, ns)
 }
 
-// resolve performs recursive DNS resolution starting from root servers
-func (s *DNSServer) resolve(qname string, qtype uint16, depth int) (*dns.Msg, error) {
-	qc := &queryContext{inFlight: make(map[string]bool)}
-	return s.resolveWithContext(qname, qtype, depth, qc)
+func (s *DNSServer) evictExpiredEntries() {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, entry := range s.cache {
+		if now.After(entry.expiration) {
+			delete(s.cache, key)
+		}
+	}
+	for zone, entry := range s.nsCache {
+		if now.After(entry.expiration) {
+			delete(s.nsCache, zone)
+		}
+	}
+	for ns, expiration := range s.badNameservers {
+		if now.After(expiration) {
+			delete(s.badNameservers, ns)
+		}
+	}
 }
 
-func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc *queryContext) (*dns.Msg, error) {
+func (s *DNSServer) startCacheEviction(ctx context.Context) {
+	ticker := time.NewTicker(cacheEvictionInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.evictExpiredEntries()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// resolve performs recursive DNS resolution starting from root servers
+func (s *DNSServer) resolve(ctx context.Context, qname string, qtype uint16, depth int) (*dns.Msg, error) {
+	qc := &queryContext{inFlight: make(map[string]bool)}
+	return s.resolveWithContext(ctx, qname, qtype, depth, qc)
+}
+
+func (s *DNSServer) resolveWithContext(ctx context.Context, qname string, qtype uint16, depth int, qc *queryContext) (*dns.Msg, error) {
 	if depth > maxRecursionDepth {
 		return nil, fmt.Errorf("maximum recursion depth exceeded")
+	}
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	// Check for circular dependency
@@ -457,11 +508,31 @@ func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc
 
 	// Start with root servers
 	nameservers := rootServers
+	var deferredNSNames []string // NS names skipped due to minReadyNS; resolved on fallback
 
 	// Iterate through the DNS hierarchy
 	for {
-		response, _, err := s.queryNameservers(qname, qtype, nameservers)
+		response, _, err := s.queryNameservers(ctx, qname, qtype, nameservers)
 		if err != nil {
+			// Before giving up, try to resolve any NS names that were deferred earlier.
+			if len(deferredNSNames) > 0 {
+				var fallbackNS []string
+				for _, nsName := range deferredNSNames {
+					nsResp, dErr := s.resolveWithContext(ctx, nsName, dns.TypeA, depth+1, qc)
+					if dErr == nil && len(nsResp.Answer) > 0 {
+						for _, rr := range nsResp.Answer {
+							if a, ok := rr.(*dns.A); ok {
+								fallbackNS = append(fallbackNS, net.JoinHostPort(a.A.String(), "53"))
+							}
+						}
+					}
+				}
+				deferredNSNames = nil
+				if len(fallbackNS) > 0 {
+					nameservers = dedupeStrings(fallbackNS)
+					continue
+				}
+			}
 			return nil, err
 		}
 
@@ -481,12 +552,13 @@ func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc
 		for _, rr := range response.Answer {
 			if cname, ok := rr.(*dns.CNAME); ok {
 				log.Printf("[Depth %d] Following CNAME: %s -> %s", depth, qname, cname.Target)
-				return s.resolveWithContext(cname.Target, qtype, depth+1, qc)
+				return s.resolveWithContext(ctx, cname.Target, qtype, depth+1, qc)
 			}
 		}
 
 		// Look for nameservers in Authority section
 		var nextNS []string
+		deferredNSNames = nil // reset for this referral level
 		nsNames := make(map[string]bool)
 		referralZone := getReferralZone(response)
 		if cachedNS := s.getZoneNameservers(referralZone); len(cachedNS) > 0 {
@@ -535,13 +607,15 @@ func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc
 						continue
 					}
 
-					// Only do expensive DNS sub-resolution when we don't yet have enough ready NSs
+					// Only do expensive DNS sub-resolution when we don't yet have enough ready NSs.
+					// Save skipped names so they can be resolved as a fallback if needed.
 					if len(nextNS) >= minReadyNS {
-						continue // Defer; fall back to this NS only if the ready ones all fail
+						deferredNSNames = append(deferredNSNames, nsName)
+						continue
 					}
 
 					log.Printf("[Depth %d] Resolving nameserver: %s", depth, nsName)
-					nsResp, err := s.resolveWithContext(nsName, dns.TypeA, depth+1, qc)
+					nsResp, err := s.resolveWithContext(ctx, nsName, dns.TypeA, depth+1, qc)
 					if err == nil && len(nsResp.Answer) > 0 {
 						for _, rr := range nsResp.Answer {
 							if a, ok := rr.(*dns.A); ok {
@@ -574,7 +648,7 @@ func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc
 }
 
 // queryNameservers queries a list of nameservers until one responds
-func (s *DNSServer) queryNameservers(qname string, qtype uint16, nameservers []string) (*dns.Msg, string, error) {
+func (s *DNSServer) queryNameservers(ctx context.Context, qname string, qtype uint16, nameservers []string) (*dns.Msg, string, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(qname), qtype)
 	m.RecursionDesired = false // We do the recursion
@@ -588,13 +662,25 @@ func (s *DNSServer) queryNameservers(qname string, qtype uint16, nameservers []s
 			continue
 		}
 
-		response, _, err := s.client.Exchange(m, ns)
+		response, _, err := s.client.ExchangeContext(ctx, m, ns)
 		if err == nil && response != nil {
+			// Retry over TCP if the UDP response was truncated
+			if response.Truncated {
+				tcpResponse, _, tcpErr := s.tcpClient.ExchangeContext(ctx, m, ns)
+				if tcpErr == nil && tcpResponse != nil {
+					s.clearNameserverBad(ns)
+					return tcpResponse, ns, nil
+				}
+				// TCP failed: fall through and return the truncated UDP response
+			}
 			s.clearNameserverBad(ns)
 			return response, ns, nil
 		}
 		if err == nil {
 			continue
+		}
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
 		}
 		s.markNameserverBad(ns)
 		// Only log non-IPv6 errors or if IPv6 is actually available
@@ -635,8 +721,10 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	// Perform recursive resolution
-	response, err := s.resolve(q.Name, q.Qtype, 0)
+	// Perform recursive resolution with an overall deadline
+	ctx, cancel := context.WithTimeout(context.Background(), queryDeadline)
+	defer cancel()
+	response, err := s.resolve(ctx, q.Name, q.Qtype, 0)
 
 	duration := time.Since(startTime)
 
@@ -665,6 +753,13 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 }
 
 func (s *DNSServer) Start(port string) error {
+	// Background context for long-lived goroutines; cancelled on shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start periodic cache eviction
+	go s.startCacheEviction(ctx)
+
 	// Create DNS server for UDP
 	serverUDP := &dns.Server{
 		Addr:    ":" + port,

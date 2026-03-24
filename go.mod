@@ -1,4 +1,4 @@
-module mydns
+module github.com/herclogon/mydns
 
 go 1.24.4
 

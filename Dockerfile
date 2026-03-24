@@ -13,16 +13,13 @@ COPY main.go ./
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-w -s" -o mydns .
 
-# Final stage - distroless
-FROM gcr.io/distroless/static:nonroot
+# Final stage - distroless runtime
+FROM gcr.io/distroless/static-debian12
 
 WORKDIR /
 
 # Copy the binary from builder
 COPY --from=builder /build/mydns /mydns
-
-# Use non-root user
-USER nonroot:nonroot
 
 # Expose DNS ports
 EXPOSE 53/udp

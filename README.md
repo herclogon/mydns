@@ -36,6 +36,7 @@ make docker-build
 ```
 
 `make build` remains available as an alias for `make docker-build`.
+The Docker image uses a distroless runtime and listens on container port `53`.
 
 ## Run
 

@@ -27,6 +27,8 @@ const (
 	maxCacheTTL = 1 * time.Hour
 	// Temporary penalty for nameservers that recently timed out or errored
 	badNameserverTTL = 1 * time.Minute
+	// Minimum number of ready NS IPs before skipping further expensive DNS sub-resolutions
+	minReadyNS = 4
 )
 
 // Root DNS servers (a.root-servers.net through m.root-servers.net)
@@ -521,9 +523,7 @@ func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc
 
 				// If no glue records, resolve the nameserver
 				if !found {
-					log.Printf("[Depth %d] Resolving nameserver: %s", depth, nsName)
-
-					// Check hints first for common TLD servers
+					// Check hints first for common TLD servers (free, always use them)
 					if ips, ok := tldHints[nsName]; ok {
 						log.Printf("[Depth %d] Using hint for %s", depth, nsName)
 						for _, ip := range ips {
@@ -532,6 +532,12 @@ func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc
 						continue
 					}
 
+					// Only do expensive DNS sub-resolution when we don't yet have enough ready NSs
+					if len(nextNS) >= minReadyNS {
+						continue // Defer; fall back to this NS only if the ready ones all fail
+					}
+
+					log.Printf("[Depth %d] Resolving nameserver: %s", depth, nsName)
 					nsResp, err := s.resolveWithContext(nsName, dns.TypeA, depth+1, qc)
 					if err == nil && len(nsResp.Answer) > 0 {
 						for _, rr := range nsResp.Answer {
@@ -611,31 +617,14 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	startTime := time.Now()
 	log.Printf("Query: %s %s from %s", q.Name, dns.TypeToString[q.Qtype], w.RemoteAddr())
 
-	if q.Qtype == dns.TypeANY {
-		response := new(dns.Msg)
-		response.SetRcode(r, dns.RcodeRefused)
-		if err := w.WriteMsg(response); err != nil {
-			if !strings.Contains(err.Error(), "broken pipe") && !strings.Contains(err.Error(), "connection reset") {
-				log.Printf("Error writing response: %v", err)
-			}
-		} else {
-			log.Printf("Rejected ANY query for %s from %s", q.Name, w.RemoteAddr())
-			log.Printf("Response sent: %d answers, %d authority, %d additional (%.2fs)",
-				len(response.Answer), len(response.Ns), len(response.Extra), time.Since(startTime).Seconds())
-		}
-		return
-	}
-
 	// Perform recursive resolution
 	response, err := s.resolve(q.Name, q.Qtype, 0)
 
 	duration := time.Since(startTime)
-	if duration > 3*time.Second {
-		log.Printf("Slow query warning: %s took %v", q.Name, duration)
-	}
 
 	if err != nil {
-		log.Printf("Resolution failed: %v", err)
+		log.Printf("Resolution failed: %s %s in %.1fms: %v",
+			q.Name, dns.TypeToString[q.Qtype], float64(duration.Nanoseconds())/1e6, err)
 		response = new(dns.Msg)
 		response.SetRcode(r, dns.RcodeServerFailure)
 	}
@@ -650,8 +639,10 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 			log.Printf("Error writing response: %v", err)
 		}
 	} else {
-		log.Printf("Response sent: %d answers, %d authority, %d additional (%.2fs)",
-			len(response.Answer), len(response.Ns), len(response.Extra), duration.Seconds())
+		log.Printf("Query done: %s %s -> %s (%d ans, %d auth, %d add) in %.1fms",
+			q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[response.Rcode],
+			len(response.Answer), len(response.Ns), len(response.Extra),
+			float64(duration.Nanoseconds())/1e6)
 	}
 }
 

@@ -74,9 +74,10 @@ func (qc *queryContext) unmarkInFlight(key string) {
 }
 
 type DNSServer struct {
-	client *dns.Client
-	cache  map[string]*cacheEntry
-	mu     sync.RWMutex
+	client      *dns.Client
+	cache       map[string]*cacheEntry
+	mu          sync.RWMutex
+	ipv6Available bool
 }
 
 // Common TLD nameserver IPs to avoid circular dependencies
@@ -97,12 +98,26 @@ var tldHints = map[string][]string{
 }
 
 func NewDNSServer() *DNSServer {
-	return &DNSServer{
+	s := &DNSServer{
 		client: &dns.Client{
 			Timeout: queryTimeout,
 		},
 		cache: make(map[string]*cacheEntry),
+		ipv6Available: checkIPv6(),
 	}
+	if !s.ipv6Available {
+		log.Println("IPv6 not available, will use IPv4 only")
+	}
+	return s
+}
+
+func checkIPv6() bool {
+	conn, err := net.Dial("udp6", "[2001:4860:4860::8888]:53")
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 func (s *DNSServer) cacheKey(qname string, qtype uint16) string {
@@ -251,18 +266,28 @@ func (s *DNSServer) resolveWithContext(qname string, qtype uint16, depth int, qc
 			}
 		}
 
-		// Try to get IPs from Additional section
+		// Try to get IPs from Additional section (prefer IPv4)
 		for nsName := range nsNames {
 			found := false
+			var ipv4Addrs []string
+			var ipv6Addrs []string
+			
+			// Collect IPv4 and IPv6 addresses separately
 			for _, rr := range response.Extra {
 				if a, ok := rr.(*dns.A); ok && strings.EqualFold(a.Hdr.Name, nsName) {
-					nextNS = append(nextNS, net.JoinHostPort(a.A.String(), "53"))
+					ipv4Addrs = append(ipv4Addrs, net.JoinHostPort(a.A.String(), "53"))
 					found = true
 				} else if aaaa, ok := rr.(*dns.AAAA); ok && strings.EqualFold(aaaa.Hdr.Name, nsName) {
-					nextNS = append(nextNS, net.JoinHostPort(aaaa.AAAA.String(), "53"))
-					found = true
+					if s.ipv6Available {
+						ipv6Addrs = append(ipv6Addrs, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+						found = true
+					}
 				}
 			}
+			
+			// Add IPv4 first, then IPv6
+			nextNS = append(nextNS, ipv4Addrs...)
+			nextNS = append(nextNS, ipv6Addrs...)
 
 			// If no glue records, resolve the nameserver
 			if !found {
@@ -310,11 +335,19 @@ func (s *DNSServer) queryNameservers(qname string, qtype uint16, nameservers []s
 	m.RecursionDesired = false // We do the recursion
 
 	for _, ns := range nameservers {
+		// Skip IPv6 if not available
+		if !s.ipv6Available && strings.Contains(ns, "[") {
+			continue
+		}
+		
 		response, _, err := s.client.Exchange(m, ns)
 		if err == nil && response != nil {
 			return response, ns, nil
 		}
-		log.Printf("Failed to query %s: %v", ns, err)
+		// Only log non-IPv6 errors or if IPv6 is actually available
+		if !strings.Contains(err.Error(), "network is unreachable") {
+			log.Printf("Failed to query %s: %v", ns, err)
+		}
 	}
 
 	return nil, "", fmt.Errorf("all nameservers failed")
@@ -331,10 +364,16 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	q := r.Question[0]
+	startTime := time.Now()
 	log.Printf("Query: %s %s from %s", q.Name, dns.TypeToString[q.Qtype], w.RemoteAddr())
 
 	// Perform recursive resolution
 	response, err := s.resolve(q.Name, q.Qtype, 0)
+	
+	duration := time.Since(startTime)
+	if duration > 3*time.Second {
+		log.Printf("Slow query warning: %s took %v", q.Name, duration)
+	}
 	
 	if err != nil {
 		log.Printf("Resolution failed: %v", err)
@@ -347,10 +386,13 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 
 	// Write the response back to the client
 	if err := w.WriteMsg(response); err != nil {
-		log.Printf("Error writing response: %v", err)
+		// Don't log "broken pipe" errors - they're normal when clients timeout
+		if !strings.Contains(err.Error(), "broken pipe") && !strings.Contains(err.Error(), "connection reset") {
+			log.Printf("Error writing response: %v", err)
+		}
 	} else {
-		log.Printf("Response sent: %d answers, %d authority, %d additional", 
-			len(response.Answer), len(response.Ns), len(response.Extra))
+		log.Printf("Response sent: %d answers, %d authority, %d additional (%.2fs)", 
+			len(response.Answer), len(response.Ns), len(response.Extra), duration.Seconds())
 	}
 }
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=mydns recursive resolver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mydns
+Group=mydns
+WorkingDirectory=/opt/mydns
+ExecStart=/opt/mydns/mydns
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/mydns.log
+StandardError=append:/var/log/mydns.log
+
+[Install]
+WantedBy=multi-user.target

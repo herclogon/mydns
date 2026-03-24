@@ -1,0 +1,11 @@
+/var/log/mydns.log {
+    su root root
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0644 mydns mydns
+}

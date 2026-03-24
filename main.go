@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -89,6 +90,7 @@ type DNSServer struct {
 	badNameservers map[string]time.Time
 	mu             sync.RWMutex
 	ipv6Available  bool
+	acceptAny      bool
 }
 
 // Common TLD nameserver IPs to avoid circular dependencies
@@ -108,7 +110,7 @@ var tldHints = map[string][]string{
 	"m.gtld-servers.net.": {"192.55.83.30"},
 }
 
-func NewDNSServer() *DNSServer {
+func NewDNSServer(acceptAny bool) *DNSServer {
 	s := &DNSServer{
 		client: &dns.Client{
 			Timeout: queryTimeout,
@@ -117,6 +119,7 @@ func NewDNSServer() *DNSServer {
 		nsCache:        make(map[string]*nsCacheEntry),
 		badNameservers: make(map[string]time.Time),
 		ipv6Available:  checkIPv6(),
+		acceptAny:      acceptAny,
 	}
 	if !s.ipv6Available {
 		log.Println("IPv6 not available, will use IPv4 only")
@@ -617,6 +620,21 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	startTime := time.Now()
 	log.Printf("Query: %s %s from %s", q.Name, dns.TypeToString[q.Qtype], w.RemoteAddr())
 
+	if q.Qtype == dns.TypeANY && !s.acceptAny {
+		response := new(dns.Msg)
+		response.SetRcode(r, dns.RcodeRefused)
+		if err := w.WriteMsg(response); err != nil {
+			if !strings.Contains(err.Error(), "broken pipe") && !strings.Contains(err.Error(), "connection reset") {
+				log.Printf("Error writing response: %v", err)
+			}
+			return
+		}
+		log.Printf("Query done: %s %s -> %s (ANY disabled) in %.1fms",
+			q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[response.Rcode],
+			float64(time.Since(startTime).Nanoseconds())/1e6)
+		return
+	}
+
 	// Perform recursive resolution
 	response, err := s.resolve(q.Name, q.Qtype, 0)
 
@@ -690,6 +708,9 @@ func (s *DNSServer) Start(port string) error {
 }
 
 func main() {
+	acceptAny := flag.Bool("accept-any", true, "accept DNS ANY queries")
+	flag.Parse()
+
 	port := defaultPort
 
 	// Allow PORT environment variable to override
@@ -719,8 +740,9 @@ func main() {
 
 	log.Printf("Using root DNS servers for recursive resolution")
 	log.Printf("Root servers: %d configured", len(rootServers))
+	log.Printf("ANY queries accepted: %t", *acceptAny)
 
-	server := NewDNSServer()
+	server := NewDNSServer(*acceptAny)
 	if err := server.Start(port); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

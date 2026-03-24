@@ -15,6 +15,7 @@ MyDNS is a lightweight recursive DNS resolver written in Go. It resolves records
 - Detailed query and resolution logging
 - Automatic fallback from port `53` to `5353` when running as non-root
 - Optional `PORT` override via environment variable
+- Configurable handling of DNS `ANY` queries via command-line flag
 
 ## Requirements
 
@@ -56,6 +57,12 @@ Run on a custom port:
 
 ```bash
 PORT=8053 ./mydns
+```
+
+Reject `ANY` queries:
+
+```bash
+./mydns -accept-any=false
 ```
 
 Build and run with Docker on host port `5353`:
@@ -107,6 +114,7 @@ Deployment guidance now lives in [DEPLOYMENT.md](DEPLOYMENT.md). It covers:
 - Delegated nameserver addresses are cached per zone to reduce repeated NS host lookups
 - IPv6 upstream queries are only used when IPv6 appears available locally
 - The server listens on `:<port>` for both UDP and TCP, which means it attempts to bind all local IPv4 addresses on that port
+- `ANY` queries are accepted by default and can be refused with `-accept-any=false`
 
 ## Make Targets
 
@@ -130,7 +138,7 @@ This is an educational and experimental DNS server. For production-critical use,
 - No DNSSEC validation
 - IPv6 nameserver resolution is basic
 - GeoDNS answers may differ from public resolvers because resolution originates from your host
-- `ANY` queries are refused to reduce abuse and unnecessary recursion
+- `ANY` queries can be refused with `-accept-any=false` if you want to reduce abuse and unnecessary recursion
 
 ## License
 
